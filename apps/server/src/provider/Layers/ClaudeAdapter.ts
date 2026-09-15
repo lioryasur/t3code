@@ -5034,7 +5034,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         input.expectedSession &&
         (context.stopped ||
           context.session.status !== "ready" ||
-          context.turnState !== null ||
+          context.turnState !== undefined ||
           context.session.activeTurnId !== undefined)
       ) {
         return new ProviderSessionFenceError({

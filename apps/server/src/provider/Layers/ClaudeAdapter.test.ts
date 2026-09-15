@@ -2263,6 +2263,33 @@ describe("ClaudeAdapterLive", () => {
     },
   );
 
+  it.effect("admits a conditional prompt into an idle Claude session", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      const result = yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "Selected idle session",
+        expectedSession: {
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+          providerSessionId: "selected",
+          readiness: "ready",
+          activeTurnId: null,
+        },
+      });
+      const text = yield* Effect.promise(() =>
+        readFirstPromptText(harness.getLastCreateQueryInput()),
+      );
+      assert.include(text, "Selected idle session");
+      assert.equal((yield* adapter.listSessions())[0]?.activeTurnId, result.turnId);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
   it.effect(
     "rejects conditional admission when background work starts during permission preparation",
     () => {

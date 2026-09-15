@@ -703,6 +703,7 @@ describe("CodexSessionRuntime collab integration", () => {
               ? { notificationsByTurn: [[], [completed]] }
               : { reloadAfterTurns: 0, reloadNotifications: [started] }),
           };
+          // @effect-diagnostics-next-line preferSchemaOverJson:off
           NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
           NodeFS.rmSync(`${scriptPath}.requests`, { force: true });
           yield* Effect.addFinalizer(() =>
