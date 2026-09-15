@@ -73,6 +73,7 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   public closeCalls = 0;
   public interruptCalls = 0;
   public closeError: unknown | undefined;
+  public permissionModeBarrier: Promise<void> | undefined;
 
   emit(message: SDKMessage): void {
     if (this.done) {
@@ -114,6 +115,7 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
 
   readonly setPermissionMode = async (mode: PermissionMode): Promise<void> => {
     this.setPermissionModeCalls.push(mode);
+    await this.permissionModeBarrier;
   };
 
   readonly setMaxThinkingTokens = async (maxThinkingTokens: number | null): Promise<void> => {
@@ -2236,24 +2238,90 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("conditionally interrupts without closing or declaring the session idle", () => {
-    const harness = makeHarness();
-    return Effect.gen(function* () {
-      const adapter = yield* ClaudeAdapter;
-      const session = yield* adapter.startSession({
-        threadId: THREAD_ID,
-        provider: ProviderDriverKind.make("claudeAgent"),
-        runtimeMode: "full-access",
-      });
-      const turn = yield* adapter.sendTurn({ threadId: session.threadId, input: "Work" });
-      yield* adapter.interruptTurn(session.threadId, turn.turnId, { preserveSession: true });
-      assert.equal(harness.query.interruptCalls, 1);
-      assert.equal(harness.query.closeCalls, 0);
-      const current = (yield* adapter.listSessions())[0];
-      assert.equal(current?.status, "running");
-      assert.equal(current?.activeTurnId, turn.turnId);
-    }).pipe(Effect.provide(harness.layer));
-  });
+  it.effect(
+    "rejects exact-turn interruption without calling Claude's session-wide interrupt",
+    () => {
+      const harness = makeHarness();
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const session = yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        });
+        const turn = yield* adapter.sendTurn({ threadId: session.threadId, input: "Work" });
+        const error = yield* adapter
+          .interruptTurn(session.threadId, turn.turnId, { preserveSession: true })
+          .pipe(Effect.flip);
+        assert.equal(error._tag, "ProviderSessionFenceError");
+        assert.equal(harness.query.interruptCalls, 0);
+        assert.equal(harness.query.closeCalls, 0);
+        const current = (yield* adapter.listSessions())[0];
+        assert.equal(current?.status, "running");
+        assert.equal(current?.activeTurnId, turn.turnId);
+      }).pipe(Effect.provide(harness.layer));
+    },
+  );
+
+  it.effect(
+    "rejects conditional admission when background work starts during permission preparation",
+    () => {
+      const harness = makeHarness();
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        });
+        const release = Promise.withResolvers<void>();
+        harness.query.permissionModeBarrier = release.promise;
+        const send = yield* adapter
+          .sendTurn({
+            threadId: THREAD_ID,
+            input: "Only when idle",
+            interactionMode: "plan",
+            expectedSession: {
+              providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+              providerSessionId: "selected",
+              readiness: "ready",
+              activeTurnId: null,
+            },
+          })
+          .pipe(Effect.result, Effect.forkChild);
+        while (harness.query.setPermissionModeCalls.length === 0) yield* Effect.yieldNow;
+        harness.query.emit({
+          type: "assistant",
+          session_id: "sdk-background",
+          uuid: "background-uuid",
+          parent_tool_use_id: null,
+          message: {
+            id: "background-message",
+            model: "synthetic",
+            content: [{ type: "text", text: "Background work" }],
+          },
+        } as unknown as SDKMessage);
+        let activeTurnId;
+        while (!activeTurnId) {
+          activeTurnId = (yield* adapter.listSessions())[0]?.activeTurnId;
+          yield* Effect.yieldNow;
+        }
+        release.resolve();
+        const result = yield* Fiber.join(send);
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure")
+          assert.equal(result.failure._tag, "ProviderSessionFenceError");
+        assert.equal((yield* adapter.listSessions())[0]?.activeTurnId, activeTurnId);
+        // The rejected prompt must not be waiting ahead of the next ordinary send.
+        yield* adapter.sendTurn({ threadId: THREAD_ID, input: "Ordinary follow-up" });
+        const text = yield* Effect.promise(() =>
+          readFirstPromptText(harness.getLastCreateQueryInput()),
+        );
+        assert.include(text, "Ordinary follow-up");
+        assert.notInclude(text, "Only when idle");
+      }).pipe(Effect.provide(harness.layer));
+    },
+  );
 
   const AUTH_FAILURE_ASSISTANT = {
     type: "assistant",

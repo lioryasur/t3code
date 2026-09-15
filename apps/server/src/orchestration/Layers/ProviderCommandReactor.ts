@@ -271,6 +271,7 @@ const make = Effect.gen(function* () {
       { type: "thread.turn-start-requested" | "thread.turn-interrupt-requested" }
     >,
     execute: Effect.Effect<TurnId | null, ProviderServiceError>,
+    background = false,
   ) {
     const expectedSession = event.payload.expectedSession;
     if (!expectedSession || !event.commandId) return;
@@ -282,20 +283,45 @@ const make = Effect.gen(function* () {
     const started = yield* executionReceipts.getByCommandId({ commandId: markerId });
     const operation = event.type === "thread.turn-start-requested" ? "send-turn" : "interrupt-turn";
     const append = (result: ProviderCommandExecutionResult) =>
-      orchestrationEngine.dispatch({
-        type: "thread.activity.append",
-        commandId: result.status === "dispatching" ? markerId : resultId,
-        threadId: event.payload.threadId,
-        activity: {
-          id: EventId.make(`${result.status === "dispatching" ? markerId : resultId}`),
-          tone: result.status === "rejected" || result.status === "uncertain" ? "error" : "info",
-          kind: "provider.command.execution",
-          summary: result.detail,
-          payload: result,
-          turnId: result.turnId,
+      Effect.gen(function* () {
+        if (
+          event.type === "thread.turn-start-requested" &&
+          (result.status === "rejected" || result.status === "uncertain")
+        ) {
+          // Clear only this pending message before finalizing its durable receipt.
+          // A crash between the two writes still replays the dispatching marker.
+          const failureId = CommandId.make(`provider-execution:${originalCommandId}:failed`);
+          yield* orchestrationEngine.dispatch({
+            type: "thread.activity.append",
+            commandId: failureId,
+            threadId: event.payload.threadId,
+            activity: {
+              id: EventId.make(failureId),
+              tone: "error",
+              kind: "provider.turn.start.failed",
+              summary: result.detail,
+              payload: { requestId: event.payload.messageId, detail: result.detail },
+              turnId: null,
+              createdAt: event.payload.createdAt,
+            },
+            createdAt: event.payload.createdAt,
+          });
+        }
+        return yield* orchestrationEngine.dispatch({
+          type: "thread.activity.append",
+          commandId: result.status === "dispatching" ? markerId : resultId,
+          threadId: event.payload.threadId,
+          activity: {
+            id: EventId.make(`${result.status === "dispatching" ? markerId : resultId}`),
+            tone: result.status === "rejected" || result.status === "uncertain" ? "error" : "info",
+            kind: "provider.command.execution",
+            summary: result.detail,
+            payload: result,
+            turnId: result.turnId,
+            createdAt: event.payload.createdAt,
+          },
           createdAt: event.payload.createdAt,
-        },
-        createdAt: event.payload.createdAt,
+        });
       });
     const base = {
       commandId: originalCommandId,
@@ -316,7 +342,7 @@ const make = Effect.gen(function* () {
       status: "dispatching",
       detail: "Dispatching to the selected provider session.",
     });
-    yield* execute.pipe(
+    const execution = execute.pipe(
       Effect.matchCauseEffect({
         onSuccess: (turnId) =>
           append({
@@ -335,6 +361,16 @@ const make = Effect.gen(function* () {
           }),
       }),
     );
+    if (background) {
+      yield* execution.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("conditional provider execution receipt failed", { cause }),
+        ),
+        Effect.forkScoped,
+      );
+    } else {
+      yield* execution;
+    }
   });
 
   const appendProviderFailureActivity = (input: {
@@ -1285,8 +1321,14 @@ const make = Effect.gen(function* () {
         ? providerService
             .sendTurn({
               threadId: event.payload.threadId,
-              input: message.text,
+              input: projectComposerContextForProvider({
+                text: message.text,
+                records: message.context?.records ?? [],
+              }),
               ...(message.attachments ? { attachments: message.attachments } : {}),
+              ...(event.payload.modelSelection
+                ? { modelSelection: event.payload.modelSelection }
+                : {}),
               expectedSession: event.payload.expectedSession,
               interactionMode: event.payload.interactionMode,
             })
@@ -1297,7 +1339,7 @@ const make = Effect.gen(function* () {
               detail: "The selected user message is no longer available.",
             }),
           );
-      yield* executeConditionalCommand(event, execute);
+      yield* executeConditionalCommand(event, execute, true);
       return;
     }
     const key = turnStartKeyForEvent(event);
@@ -1616,6 +1658,7 @@ const make = Effect.gen(function* () {
               : {}),
           })
           .pipe(Effect.as(null)),
+        true,
       );
       return;
     }
@@ -1968,6 +2011,9 @@ const make = Effect.gen(function* () {
   const worker = yield* makeDrainableWorker(processDomainEventSafely);
 
   const start: ProviderCommandReactorShape["start"] = Effect.fn("start")(function* () {
+    // Subscribe before capturing the replay boundary so commands accepted during
+    // startup are either closed by recovery or delivered by the live subscription.
+    const domainEvents = yield* orchestrationEngine.subscribeDomainEvents;
     const startupSequence = yield* orchestrationEngine.latestSequence;
     const pendingTitles = yield* findPendingThreadTitles().pipe(
       Effect.catchCause((cause) => {
@@ -1981,6 +2027,13 @@ const make = Effect.gen(function* () {
       }),
     );
     const processEvent = Effect.fn("processEvent")(function* (event: OrchestrationEvent) {
+      if (
+        event.sequence <= startupSequence &&
+        (event.type === "thread.turn-start-requested" ||
+          event.type === "thread.turn-interrupt-requested") &&
+        event.payload.expectedSession
+      )
+        return;
       if (
         (event.type === "thread.meta-updated" &&
           (event.payload.regenerateTitle === true ||
@@ -1999,7 +2052,6 @@ const make = Effect.gen(function* () {
     });
 
     // Subscribe before returning, even while event handling waits for server activation.
-    const domainEvents = yield* orchestrationEngine.subscribeDomainEvents;
     yield* forkParked(Stream.runForEach(domainEvents, processEvent));
 
     // ponytail: page the durable log on startup; add an indexed conditional-intent query if

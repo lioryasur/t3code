@@ -1223,6 +1223,77 @@ unsupportedRollback.layer("ProviderServiceLive unsupported rewind", (it) => {
 
 const fenced = makeProviderServiceLayer();
 fenced.layer("ProviderService session fences", (it) => {
+  for (const operation of ["send", "compaction"] as const) {
+    it.effect(`Stop cancels a stalled ${operation} acknowledgment and releases replacement`, () =>
+      Effect.gen(function* () {
+        const service = yield* ProviderService.ProviderService;
+        const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        const threadId = asThreadId(`stop-stalled-${operation}`);
+        const start = {
+          threadId,
+          providerInstanceId: codexInstanceId,
+          runtimeMode: "full-access" as const,
+        };
+        const session = yield* service.startSession(threadId, start);
+        const entered = yield* Deferred.make<void>();
+        const stalled = Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never));
+        if (operation === "send") fenced.codex.sendTurn.mockImplementationOnce(() => stalled);
+        else fenced.codex.compactThread.mockImplementationOnce(() => stalled);
+        const admission = yield* (
+          operation === "send"
+            ? service
+                .sendTurn({
+                  threadId,
+                  input: "Work",
+                  expectedSession: {
+                    providerInstanceId: codexInstanceId,
+                    providerSessionId: session.providerSessionId!,
+                    activeTurnId: null,
+                    readiness: "ready",
+                  },
+                })
+                .pipe(Effect.asVoid)
+            : service.compactThread(threadId)
+        ).pipe(Effect.result, Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* service.stopSession({ threadId });
+        assert.equal((yield* Fiber.join(admission))._tag, "Failure");
+        const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+        assert.equal(binding.status, "stopped");
+        const replacement = yield* service.startSession(threadId, start);
+        assert.notEqual(replacement.providerSessionId, session.providerSessionId);
+        yield* service.stopSession({ threadId });
+      }),
+    );
+  }
+
+  it.effect("rejects a conditional stop for an exited session without changing its binding", () =>
+    Effect.gen(function* () {
+      const service = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("conditional-stop-exited");
+      const session = yield* service.startSession(threadId, {
+        threadId,
+        providerInstanceId: codexInstanceId,
+        runtimeMode: "full-access",
+      });
+      yield* fenced.codex.stopSession(threadId);
+      const before = yield* directory.getBinding(threadId);
+      const result = yield* service
+        .stopSession({
+          threadId,
+          expectedSession: {
+            providerInstanceId: codexInstanceId,
+            providerSessionId: session.providerSessionId!,
+            activeTurnId: null,
+            readiness: "ready",
+          },
+        })
+        .pipe(Effect.flip);
+      assert.equal(result._tag, "ProviderSessionFenceError");
+      assert.deepEqual(yield* directory.getBinding(threadId), before);
+    }),
+  );
   for (const operation of ["compaction", "feedback"] as const) {
     it.effect(`${operation} recovery waits for an admitted conditional send`, () =>
       Effect.gen(function* () {

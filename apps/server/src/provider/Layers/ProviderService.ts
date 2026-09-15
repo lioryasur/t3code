@@ -870,6 +870,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   // Stop must still work while a provider is acknowledging a send. Its escape path
   // captures that adapter and cannot recover or rebind to a different session.
   const pendingSendInterrupts = new Map<ThreadId, ProviderServiceMethod<"interruptTurn">>();
+  const pendingSendStops = new Map<ThreadId, ProviderServiceMethod<"stopSession">>();
   const withThreadCommand = <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) =>
     Effect.suspend(() => {
       const entry = commandLocks.get(threadId) ?? { semaphore: Semaphore.makeUnsafe(1), users: 0 };
@@ -1796,6 +1797,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           `Provider '${routed.adapter.provider}' requires an explicit continuation prompt`,
         );
       }
+      if (
+        input.expectedSession &&
+        (input.expectedSession.readiness !== "ready" ||
+          input.expectedSession.activeTurnId !== null ||
+          pendingCompactions.has(input.threadId) ||
+          timedOutNativeCompactions.has(input.threadId))
+      ) {
+        return yield* new ProviderSessionFenceError({
+          threadId: input.threadId,
+          detail: "A conditional send requires an idle provider session.",
+        });
+      }
       const supportsConditionalSend =
         routed.adapter.provider === "codex" || routed.adapter.provider === "claudeAgent";
       if (supportsConditionalSend && !locked)
@@ -1813,18 +1826,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           threadId: input.threadId,
           operation: "ProviderService.sendTurn",
           allowRecovery: true,
-        });
-      }
-      if (
-        input.expectedSession &&
-        (input.expectedSession.readiness !== "ready" ||
-          input.expectedSession.activeTurnId !== null ||
-          pendingCompactions.has(input.threadId) ||
-          timedOutNativeCompactions.has(input.threadId))
-      ) {
-        return yield* new ProviderSessionFenceError({
-          threadId: input.threadId,
-          detail: "A conditional send requires an idle provider session.",
         });
       }
       metricProvider = routed.adapter.provider;
@@ -1845,36 +1846,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         routed.instanceId,
         input.expectedSession,
       );
-      let interruptCount = 0;
-      let interruptsDone = Deferred.makeUnsafe<void>();
-      if (supportsConditionalSend) {
-        const interruptPending: ProviderServiceMethod<"interruptTurn"> = (rawInterrupt) =>
-          Effect.suspend(() => {
-            if (pendingSendInterrupts.get(input.threadId) !== interruptPending)
-              return withThreadCommand(input.threadId, interruptTurn(rawInterrupt));
-            if (interruptCount++ === 0) interruptsDone = Deferred.makeUnsafe<void>();
-            return Effect.gen(function* () {
-              const interrupt = yield* decodeInputOrValidationError({
-                operation: "ProviderService.interruptTurn",
-                schema: ProviderInterruptTurnInput,
-                payload: rawInterrupt,
-              });
-              yield* routed.adapter.interruptTurn(routed.threadId, interrupt.turnId);
-              yield* analytics.record("provider.turn.interrupted", {
-                provider: routed.adapter.provider,
-              });
-            }).pipe(
-              Effect.ensuring(
-                Effect.suspend(() =>
-                  --interruptCount === 0
-                    ? Deferred.succeed(interruptsDone, undefined).pipe(Effect.asVoid)
-                    : Effect.void,
-                ),
-              ),
-            );
-          });
-        pendingSendInterrupts.set(input.threadId, interruptPending);
-      }
       const analyticsModelSelection =
         input.modelSelection?.instanceId === routed.instanceId ? input.modelSelection : undefined;
       const turn = yield* Effect.acquireUseRelease(
@@ -1888,14 +1859,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         }),
         (turnMetadata) =>
           Effect.gen(function* () {
-            const turn = yield* routed.adapter.sendTurn(input).pipe(
-              Effect.ensuring(
-                Effect.suspend(() => {
-                  pendingSendInterrupts.delete(input.threadId);
-                  return interruptCount === 0 ? Effect.void : Deferred.await(interruptsDone);
-                }),
-              ),
-            );
+            const turn = yield* supportsConditionalSend
+              ? withPendingAdmission(routed, "turn/start", routed.adapter.sendTurn(input))
+              : routed.adapter.sendTurn(input);
             yield* associateTurnAnalytics({
               providerInstanceId: routed.instanceId,
               threadId: input.threadId,
@@ -1957,6 +1923,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const compactThread: ProviderServiceMethod<"compactThread"> = Effect.fn("compactThread")(
     function* (threadId, modelSelection, requestId) {
+      if (pendingCompactions.has(threadId)) {
+        return yield* toValidationError(
+          "ProviderService.compactThread",
+          "Context compaction is already in progress.",
+        );
+      }
       // Recovery and admission share the session fence lock. Completion waits
       // outside it so Stop and fallback sends can still reach the provider.
       const { routed, compaction, pending } = yield* withThreadCommand(
@@ -2019,8 +1991,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           pendingCompactions.delete(threadId);
         }
       });
-      const awaitNativeCompaction = (start: Effect.Effect<void, ProviderAdapterError>) =>
-        start.pipe(
+      const awaitNativeCompaction = (start: () => Effect.Effect<void, ProviderAdapterError>) =>
+        withThreadCommand(
+          threadId,
+          Effect.suspend(() =>
+            pendingCompactions.get(threadId) === pending
+              ? withPendingAdmission(routed, "thread/compact", start())
+              : Effect.void,
+          ),
+        ).pipe(
           Effect.andThen(Deferred.await(completion)),
           Effect.timeout(COMPACTION_COMPLETION_TIMEOUT),
           Effect.catchTag("TimeoutError", (cause) =>
@@ -2054,7 +2033,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       );
       const terminal = yield* (
         compaction.type === "native"
-          ? awaitNativeCompaction(compaction.start(routed.threadId, modelSelection))
+          ? awaitNativeCompaction(() => compaction.start(routed.threadId, modelSelection))
           : Effect.gen(function* () {
               const turn = yield* sendTurn({
                 threadId,
@@ -2126,11 +2105,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           routed.instanceId,
           input.expectedSession,
         );
-        if (
-          input.expectedSession &&
-          routed.adapter.provider !== "codex" &&
-          routed.adapter.provider !== "claudeAgent"
-        )
+        if (input.expectedSession && routed.adapter.provider !== "codex")
           return yield* new ProviderSessionFenceError({
             threadId: input.threadId,
             detail: "This provider does not yet support conditional interruption.",
@@ -2233,8 +2208,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     );
   });
 
-  const stopSession: ProviderServiceMethod<"stopSession"> = Effect.fn("stopSession")(
-    function* (rawInput) {
+  const stopSession: (
+    input: Parameters<ProviderServiceMethod<"stopSession">>[0],
+    admittedRoute?: Effect.Success<ReturnType<typeof resolveRoutableSession>>,
+  ) => ReturnType<ProviderServiceMethod<"stopSession">> = Effect.fn("stopSession")(
+    function* (rawInput, admittedRoute) {
       const input = yield* decodeInputOrValidationError({
         operation: "ProviderService.stopSession",
         schema: ProviderStopSessionInput,
@@ -2242,24 +2220,26 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       });
       let metricProvider = "unknown";
       return yield* Effect.gen(function* () {
-        const routed = yield* resolveRoutableSession({
-          threadId: input.threadId,
-          operation: "ProviderService.stopSession",
-          allowRecovery: false,
-        });
+        const routed =
+          admittedRoute ??
+          (yield* resolveRoutableSession({
+            threadId: input.threadId,
+            operation: "ProviderService.stopSession",
+            allowRecovery: false,
+          }));
         metricProvider = routed.adapter.provider;
         yield* Effect.annotateCurrentSpan({
           "provider.operation": "stop-session",
           "provider.kind": routed.adapter.provider,
           "provider.thread_id": input.threadId,
         });
+        yield* checkSessionFence(
+          input.threadId,
+          routed.adapter,
+          routed.instanceId,
+          input.expectedSession,
+        );
         if (routed.isActive) {
-          yield* checkSessionFence(
-            input.threadId,
-            routed.adapter,
-            routed.instanceId,
-            input.expectedSession,
-          );
           const session = (yield* routed.adapter.listSessions()).find(
             (session) => session.threadId === routed.threadId,
           );
@@ -2304,6 +2284,84 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       );
     },
   );
+
+  // The caller holds the thread lock. Stop and interrupt can reach the captured
+  // adapter while an acknowledgment is pending; replacement waits for both.
+  const withPendingAdmission = <A, E, R>(
+    routed: Effect.Success<ReturnType<typeof resolveRoutableSession>>,
+    method: "turn/start" | "thread/compact",
+    admission: Effect.Effect<A, E, R>,
+  ) =>
+    Effect.gen(function* () {
+      const threadId = routed.threadId;
+      const stopped = Deferred.makeUnsafe<void>();
+      let wasStopped = false;
+      let pendingActions = 0;
+      let actionsDone = Deferred.makeUnsafe<void>();
+      const tracked = <B, E2, R2>(action: Effect.Effect<B, E2, R2>) =>
+        Effect.suspend(() => {
+          if (pendingActions++ === 0) actionsDone = Deferred.makeUnsafe<void>();
+          return action.pipe(
+            Effect.ensuring(
+              Effect.suspend(() =>
+                --pendingActions === 0
+                  ? Deferred.succeed(actionsDone, undefined).pipe(Effect.asVoid)
+                  : Effect.void,
+              ),
+            ),
+          );
+        });
+      const interruptPending: ProviderServiceMethod<"interruptTurn"> = (rawInput) =>
+        Effect.suspend(() => {
+          if (pendingSendInterrupts.get(threadId) !== interruptPending)
+            return withThreadCommand(threadId, interruptTurn(rawInput));
+          return tracked(
+            Effect.gen(function* () {
+              const input = yield* decodeInputOrValidationError({
+                operation: "ProviderService.interruptTurn",
+                schema: ProviderInterruptTurnInput,
+                payload: rawInput,
+              });
+              yield* routed.adapter.interruptTurn(threadId, input.turnId);
+              yield* analytics.record("provider.turn.interrupted", {
+                provider: routed.adapter.provider,
+              });
+            }),
+          );
+        });
+      const stopPending: ProviderServiceMethod<"stopSession"> = (input) =>
+        Effect.suspend(() => {
+          if (pendingSendStops.get(threadId) !== stopPending)
+            return withThreadCommand(threadId, stopSession(input));
+          return tracked(
+            stopSession(input, routed).pipe(
+              Effect.tap(() => {
+                wasStopped = true;
+                return Deferred.succeed(stopped, undefined);
+              }),
+            ),
+          );
+        });
+      pendingSendInterrupts.set(threadId, interruptPending);
+      pendingSendStops.set(threadId, stopPending);
+      const stoppedError = new ProviderAdapterRequestError({
+        provider: routed.adapter.provider,
+        method,
+        detail: "The provider session was stopped before acknowledgment completed.",
+      });
+      const result = yield* admission.pipe(
+        Effect.raceFirst(Deferred.await(stopped).pipe(Effect.andThen(Effect.fail(stoppedError)))),
+        Effect.ensuring(
+          Effect.suspend(() => {
+            pendingSendInterrupts.delete(threadId);
+            pendingSendStops.delete(threadId);
+            return pendingActions === 0 ? Effect.void : Deferred.await(actionsDone);
+          }),
+        ),
+      );
+      if (wasStopped) return yield* stoppedError;
+      return result;
+    });
 
   const listSessions: ProviderServiceMethod<"listSessions"> = Effect.fn("listSessions")(
     function* () {
@@ -2632,7 +2690,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       }),
     respondToRequest: (input) => withThreadCommand(input.threadId, respondToRequest(input)),
     respondToUserInput: (input) => withThreadCommand(input.threadId, respondToUserInput(input)),
-    stopSession: (input) => withThreadCommand(input.threadId, stopSession(input)),
+    stopSession: (input) =>
+      Effect.suspend(() => {
+        const pending =
+          input.expectedSession === undefined ? pendingSendStops.get(input.threadId) : undefined;
+        return pending ? pending(input) : withThreadCommand(input.threadId, stopSession(input));
+      }),
     compactThread,
     assertConversationRollbackSupported,
     listSessions,

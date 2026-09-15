@@ -214,6 +214,7 @@ export class ProviderSessionDirectoryPersistenceError extends Schema.TaggedError
 }
 
 export type ProviderAdapterError =
+  | ProviderSessionFenceError
   | ProviderAdapterValidationError
   | ProviderAdapterSessionNotFoundError
   | ProviderAdapterSessionClosedError
