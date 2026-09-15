@@ -71,6 +71,7 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   public readonly setPermissionModeCalls: Array<string> = [];
   public readonly setMaxThinkingTokensCalls: Array<number | null> = [];
   public closeCalls = 0;
+  public interruptCalls = 0;
   public closeError: unknown | undefined;
 
   emit(message: SDKMessage): void {
@@ -125,6 +126,10 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
       throw this.closeError;
     }
     this.finish();
+  };
+
+  readonly interrupt = async (): Promise<void> => {
+    this.interruptCalls += 1;
   };
 
   [Symbol.asyncIterator](): AsyncIterator<SDKMessage> {
@@ -2229,6 +2234,25 @@ describe("ClaudeAdapterLive", () => {
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
     );
+  });
+
+  it.effect("conditionally interrupts without closing or declaring the session idle", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({ threadId: session.threadId, input: "Work" });
+      yield* adapter.interruptTurn(session.threadId, turn.turnId, { preserveSession: true });
+      assert.equal(harness.query.interruptCalls, 1);
+      assert.equal(harness.query.closeCalls, 0);
+      const current = (yield* adapter.listSessions())[0];
+      assert.equal(current?.status, "running");
+      assert.equal(current?.activeTurnId, turn.turnId);
+    }).pipe(Effect.provide(harness.layer));
   });
 
   const AUTH_FAILURE_ASSISTANT = {

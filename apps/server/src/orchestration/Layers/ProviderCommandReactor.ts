@@ -11,6 +11,7 @@ import {
   type ProviderSession,
   type RuntimeMode,
   type TurnId,
+  type ProviderCommandExecutionResult,
 } from "@t3tools/contracts";
 import { assistantCitationsToPlainText } from "@t3tools/shared/assistantCitations";
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
@@ -35,9 +36,11 @@ import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { increment, orchestrationEventsProcessedTotal } from "../../observability/Metrics.ts";
 import {
   ProviderAdapterRequestError,
+  ProviderSessionFenceError,
   ProviderAdapterValidationError,
   ProviderWorkspaceMissingError,
 } from "../../provider/Errors.ts";
+import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
 import type { ProviderServiceError } from "../../provider/Errors.ts";
 import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
 import { ProviderAuthService } from "../../provider/Services/ProviderAuthService.ts";
@@ -66,6 +69,7 @@ const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderAdapterValidationError = Schema.is(ProviderAdapterValidationError);
 const isProviderWorkspaceMissingError = Schema.is(ProviderWorkspaceMissingError);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
+const isSessionFenceError = Schema.is(ProviderSessionFenceError);
 
 type ProviderIntentEvent = Extract<
   OrchestrationEvent,
@@ -207,6 +211,7 @@ function buildGeneratedWorktreeBranchName(raw: string): string {
 
 const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
+  const executionReceipts = yield* OrchestrationCommandReceiptRepository;
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerAuthService = yield* ProviderAuthService;
@@ -259,6 +264,78 @@ const make = Effect.gen(function* () {
     }
   >();
   const stoppingThreadIds = new Set<ThreadId>();
+
+  const executeConditionalCommand = Effect.fn("executeConditionalCommand")(function* (
+    event: Extract<
+      ProviderIntentEvent,
+      { type: "thread.turn-start-requested" | "thread.turn-interrupt-requested" }
+    >,
+    execute: Effect.Effect<TurnId | null, ProviderServiceError>,
+  ) {
+    const expectedSession = event.payload.expectedSession;
+    if (!expectedSession || !event.commandId) return;
+    const originalCommandId = event.commandId;
+    const markerId = CommandId.make(`provider-execution:${originalCommandId}:dispatching`);
+    const resultId = CommandId.make(`provider-execution:${originalCommandId}:result`);
+    const completed = yield* executionReceipts.getByCommandId({ commandId: resultId });
+    if (Option.isSome(completed)) return;
+    const started = yield* executionReceipts.getByCommandId({ commandId: markerId });
+    const operation = event.type === "thread.turn-start-requested" ? "send-turn" : "interrupt-turn";
+    const append = (result: ProviderCommandExecutionResult) =>
+      orchestrationEngine.dispatch({
+        type: "thread.activity.append",
+        commandId: result.status === "dispatching" ? markerId : resultId,
+        threadId: event.payload.threadId,
+        activity: {
+          id: EventId.make(`${result.status === "dispatching" ? markerId : resultId}`),
+          tone: result.status === "rejected" || result.status === "uncertain" ? "error" : "info",
+          kind: "provider.command.execution",
+          summary: result.detail,
+          payload: result,
+          turnId: result.turnId,
+          createdAt: event.payload.createdAt,
+        },
+        createdAt: event.payload.createdAt,
+      });
+    const base = {
+      commandId: originalCommandId,
+      operation,
+      expectedSession,
+      turnId: null,
+    } as const;
+    if (Option.isSome(started)) {
+      yield* append({
+        ...base,
+        status: "uncertain",
+        detail: "An earlier execution started without a final result. It will not be sent again.",
+      });
+      return;
+    }
+    yield* append({
+      ...base,
+      status: "dispatching",
+      detail: "Dispatching to the selected provider session.",
+    });
+    yield* execute.pipe(
+      Effect.matchCauseEffect({
+        onSuccess: (turnId) =>
+          append({
+            ...base,
+            turnId,
+            status: "dispatched",
+            detail: "Delivered to the selected provider session.",
+          }),
+        onFailure: (cause) =>
+          append({
+            ...base,
+            status: Cause.findErrorOption(cause).pipe(Option.exists(isSessionFenceError))
+              ? "rejected"
+              : "uncertain",
+            detail: formatFailureDetail(cause),
+          }),
+      }),
+    );
+  });
 
   const appendProviderFailureActivity = (input: {
     readonly threadId: ThreadId;
@@ -731,6 +808,7 @@ const make = Effect.gen(function* () {
                 : mapProviderSessionStatusToOrchestrationStatus(session.status),
             providerName: session.provider,
             providerInstanceId: session.providerInstanceId,
+            ...(session.providerSessionId ? { providerSessionId: session.providerSessionId } : {}),
             runtimeMode: desiredRuntimeMode,
             // Provider turn ids are not orchestration turn ids.
             activeTurnId: null,
@@ -1198,6 +1276,30 @@ const make = Effect.gen(function* () {
     const resumed =
       receivedEvent.commandId !== null ? resumedTurnStarts.get(receivedEvent.commandId) : undefined;
     const event = resumed ? { ...receivedEvent, payload: resumed.event.payload } : receivedEvent;
+    if (event.payload.expectedSession) {
+      const thread = yield* resolveThreadDetail(event.payload.threadId);
+      const message = thread?.messages.find(
+        (entry) => entry.id === event.payload.messageId && entry.role === "user",
+      );
+      const execute = message
+        ? providerService
+            .sendTurn({
+              threadId: event.payload.threadId,
+              input: message.text,
+              ...(message.attachments ? { attachments: message.attachments } : {}),
+              expectedSession: event.payload.expectedSession,
+              interactionMode: event.payload.interactionMode,
+            })
+            .pipe(Effect.map((result) => result.turnId))
+        : Effect.fail(
+            new ProviderSessionFenceError({
+              threadId: event.payload.threadId,
+              detail: "The selected user message is no longer available.",
+            }),
+          );
+      yield* executeConditionalCommand(event, execute);
+      return;
+    }
     const key = turnStartKeyForEvent(event);
     if (yield* hasHandledTurnStartRecently(key)) {
       return;
@@ -1502,6 +1604,21 @@ const make = Effect.gen(function* () {
   const processTurnInterruptRequested = Effect.fn("processTurnInterruptRequested")(function* (
     event: Extract<ProviderIntentEvent, { type: "thread.turn-interrupt-requested" }>,
   ) {
+    if (event.payload.expectedSession) {
+      yield* executeConditionalCommand(
+        event,
+        providerService
+          .interruptTurn({
+            threadId: event.payload.threadId,
+            expectedSession: event.payload.expectedSession,
+            ...(event.payload.expectedSession.activeTurnId
+              ? { turnId: event.payload.expectedSession.activeTurnId }
+              : {}),
+          })
+          .pipe(Effect.as(null)),
+      );
+      return;
+    }
     yield* cancelTurnsAfterCompaction(
       event.payload.threadId,
       "Context compaction was interrupted. Send this message again to continue.",
@@ -1851,6 +1968,7 @@ const make = Effect.gen(function* () {
   const worker = yield* makeDrainableWorker(processDomainEventSafely);
 
   const start: ProviderCommandReactorShape["start"] = Effect.fn("start")(function* () {
+    const startupSequence = yield* orchestrationEngine.latestSequence;
     const pendingTitles = yield* findPendingThreadTitles().pipe(
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) {
@@ -1884,29 +2002,70 @@ const make = Effect.gen(function* () {
     const domainEvents = yield* orchestrationEngine.subscribeDomainEvents;
     yield* forkParked(Stream.runForEach(domainEvents, processEvent));
 
+    // ponytail: page the durable log on startup; add an indexed conditional-intent query if
+    // startup replay becomes material. Never resend an operation whose outcome is unknown.
+    const closeInterruptedConditionalCommands = Effect.gen(function* () {
+      let cursor = 0;
+      while (cursor < startupSequence) {
+        const events = Array.from(
+          yield* Stream.runCollect(
+            orchestrationEngine.readEvents(cursor, Math.min(1_000, startupSequence - cursor)),
+          ),
+        );
+        if (events.length === 0) break;
+        for (const event of events) {
+          if (event.sequence > startupSequence) {
+            cursor = startupSequence;
+            break;
+          }
+          cursor = event.sequence;
+          if (
+            (event.type === "thread.turn-start-requested" ||
+              event.type === "thread.turn-interrupt-requested") &&
+            event.payload.expectedSession
+          ) {
+            yield* executeConditionalCommand(
+              event,
+              Effect.fail(
+                new ProviderSessionFenceError({
+                  threadId: event.payload.threadId,
+                  detail:
+                    "The server restarted before this command had a confirmed execution result. Choose again against the current session.",
+                }),
+              ),
+            );
+          }
+        }
+      }
+    });
+
     // Earlier events do not replay. Clear interrupted requests by their captured
     // IDs, then schedule persisted refinements after subscribing to their events.
-    const recoverTitles = clearInterruptedThreadTitleRegenerations(
-      pendingTitles.interruptedRegenerations,
-    ).pipe(
-      Effect.andThen(
-        Effect.forEach(pendingTitles.refinementThreadIds, maybeRefineThreadTitle, {
-          discard: true,
+    const recoverTitles = closeInterruptedConditionalCommands
+      .pipe(
+        Effect.andThen(
+          clearInterruptedThreadTitleRegenerations(pendingTitles.interruptedRegenerations),
+        ),
+      )
+      .pipe(
+        Effect.andThen(
+          Effect.forEach(pendingTitles.refinementThreadIds, maybeRefineThreadTitle, {
+            discard: true,
+          }),
+        ),
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterruptsOnly(cause)) {
+            return Effect.interrupt;
+          }
+          return Effect.logWarning(
+            "provider command reactor failed to recover pending thread titles",
+            {
+              failureKind: Cause.hasDies(cause) ? "defect" : "failure",
+              reasonCount: cause.reasons.length,
+            },
+          );
         }),
-      ),
-      Effect.catchCause((cause) => {
-        if (Cause.hasInterruptsOnly(cause)) {
-          return Effect.interrupt;
-        }
-        return Effect.logWarning(
-          "provider command reactor failed to recover pending thread titles",
-          {
-            failureKind: Cause.hasDies(cause) ? "defect" : "failure",
-            reasonCount: cause.reasons.length,
-          },
-        );
-      }),
-    );
+      );
     const activation = yield* ServerActivation;
     if (activation === undefined) {
       yield* recoverTitles;

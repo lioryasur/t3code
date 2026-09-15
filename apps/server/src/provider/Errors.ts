@@ -102,8 +102,18 @@ export class ProviderWorkspaceMissingError extends Schema.TaggedError<ProviderWo
 }
 
 /**
- * ProviderValidationError - Invalid provider API input.
+ * A conditional command no longer matches the selected live session.
  */
+export class ProviderSessionFenceError extends Schema.TaggedError<ProviderSessionFenceError>()(
+  "ProviderSessionFenceError",
+  { threadId: Schema.String, detail: Schema.String },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
+/** Invalid provider API input. */
 export class ProviderValidationError extends Schema.TaggedError<ProviderValidationError>()(
   "ProviderValidationError",
   {
@@ -211,6 +221,7 @@ export type ProviderAdapterError =
   | ProviderAdapterProcessError;
 
 export type ProviderServiceError =
+  | ProviderSessionFenceError
   | ProviderValidationError
   | ProviderUnsupportedError
   | ProviderWorkspaceMissingError

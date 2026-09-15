@@ -363,6 +363,7 @@ interface ClaudeSessionContext {
 }
 
 interface ClaudeQueryRuntime extends AsyncIterable<SDKMessage> {
+  readonly interrupt: () => Promise<void>;
   readonly setModel: (model?: string) => Promise<void>;
   readonly setPermissionMode: (mode: PermissionMode) => Promise<void>;
   readonly setMaxThinkingTokens: (maxThinkingTokens: number | null) => Promise<void>;
@@ -5084,8 +5085,15 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   });
 
   const interruptTurn: ClaudeAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
-    function* (threadId, _turnId) {
+    function* (threadId, _turnId, options) {
       const context = yield* requireSession(threadId);
+      if (options?.preserveSession) {
+        yield* Effect.tryPromise({
+          try: () => context.query.interrupt(),
+          catch: (cause) => toRequestError(threadId, "turn/interrupt", cause),
+        });
+        return;
+      }
       // interrupt() can acknowledge while resumed background tasks keep the
       // CLI alive. Stop is a hard session boundary for Claude, so close the
       // query and let the SDK escalate to SIGKILL when graceful exit fails.
