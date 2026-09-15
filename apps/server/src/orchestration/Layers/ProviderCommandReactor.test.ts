@@ -3369,7 +3369,10 @@ describe("ProviderCommandReactor", () => {
   });
 
   it("reuses the same provider session when runtime mode is unchanged", async () => {
-    const harness = await createHarness();
+    const harness = await createHarness({
+      startSessionEffect: (session) =>
+        Effect.succeed({ ...session, providerSessionId: "reused-generation" }),
+    });
     const now = "2026-01-01T00:00:00.000Z";
 
     await Effect.runPromise(
@@ -3391,6 +3394,9 @@ describe("ProviderCommandReactor", () => {
 
     await waitFor(() => harness.startSession.mock.calls.length === 1);
     await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    expect((await harness.readModel()).threads[0]?.session?.providerSessionId).toBe(
+      "reused-generation",
+    );
 
     await Effect.runPromise(
       harness.engine.dispatch({
@@ -3412,6 +3418,9 @@ describe("ProviderCommandReactor", () => {
     await waitFor(() => harness.sendTurn.mock.calls.length === 2);
     expect(harness.startSession.mock.calls.length).toBe(1);
     expect(harness.stopSession.mock.calls.length).toBe(0);
+    expect((await harness.readModel()).threads[0]?.session?.providerSessionId).toBe(
+      "reused-generation",
+    );
   });
 
   it("restarts an existing Codex thread on a compatible requested instance", async () => {

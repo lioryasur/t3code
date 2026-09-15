@@ -752,6 +752,9 @@ const make = Effect.gen(function* () {
           status: "starting",
           providerName: activeSession?.provider ?? preferredProvider,
           providerInstanceId: activeSession?.providerInstanceId ?? desiredInstanceId,
+          ...(thread.session?.providerSessionId
+            ? { providerSessionId: thread.session.providerSessionId }
+            : {}),
           runtimeMode: desiredRuntimeMode,
           activeTurnId: null,
           lastError: null,
